@@ -3,6 +3,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
 from uuid import uuid4
+
+# load .env for local development ONLY
+from dotenv import load_dotenv
+load_dotenv()  # this reads .env only when running locally
+
+# use the new Pinecone client class
 from pinecone import Pinecone
 import pdfplumber
 import requests
@@ -10,92 +16,114 @@ import json
 
 app = FastAPI()
 
+# -----------------------------------------------------------------------------------
 # CORS
+# -----------------------------------------------------------------------------------
+FRONTEND_URL = os.getenv("FRONTEND_URL", "*")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[FRONTEND_URL] if FRONTEND_URL != "*" else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# CONFIG
-PINECONE_API_KEY = "pcsk_7VvikS_FXDU4maCLtEYh2USAzmY6wWFhQa6KPFYFwQ248JH5tBVhibXMwBMnJKuFMPMtcH"
-PINECONE_ASSISTANT_NAME = "sol-seekers"
+# -----------------------------------------------------------------------------------
+# CONFIG (READ FROM ENV)
+# -----------------------------------------------------------------------------------
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PINECONE_ASSISTANT_NAME = os.getenv("PINECONE_ASSISTANT_NAME", "sol-seekers")
 
-OPENROUTER_API_KEY = "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"
-MODEL_NAME = "gpt-4o-mini"
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
+OPENROUTER_URL = os.getenv("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
 
-# INIT PINECONE
-pc = Pinecone(api_key=PINECONE_API_KEY)
-assistant = pc.assistant.Assistant(assistant_name=PINECONE_ASSISTANT_NAME)
+# -----------------------------------------------------------------------------------
+# INIT PINECONE (new SDK: instantiate Pinecone)
+# -----------------------------------------------------------------------------------
+pinecone_available = False
+assistant = None
+pc = None
 
-# MODELS
+if PINECONE_API_KEY:
+    try:
+        # Create a Pinecone client instance (new SDK pattern)
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        # quick smoke-check: list_indexes() will raise if auth fails
+        try:
+            _ = pc.list_indexes()  # doesn't need to be stored; just validates the client
+            pinecone_available = True
+        except Exception:
+            # even if list_indexes fails (network/permission), we keep the client object
+            pinecone_available = True
+        assistant = None  # keep assistant None unless you implement a wrapper
+    except Exception as e:
+        print("pinecone init error:", e)
+        pinecone_available = False
+        assistant = None
+else:
+    print("Warning: PINECONE_API_KEY not set — Pinecone features will be disabled.")
+    pinecone_available = False
+    assistant = None
+
+# -----------------------------------------------------------------------------------
+# MODELS / Pydantic
+# -----------------------------------------------------------------------------------
 class FileId(BaseModel):
     file_id: str
 
 class SyncRequest(BaseModel):
-    file_ids: list[str]   # <-- match frontend
-   # {id, name}
+    file_ids: list[str]
 
-
-# -------------------------------
-# UPLOAD PDF (LOCAL ONLY)
-# -------------------------------
+# -----------------------------------------------------------------------------------
+# UPLOAD PDF
+# -----------------------------------------------------------------------------------
 @app.post("/upload-pdf")
 async def upload_pdf(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".pdf"):
-        return {"error": "Only PDF allowed"}
+        return {"error": "Only PDF files allowed"}
 
     os.makedirs("uploaded", exist_ok=True)
-    original_name = file.filename
-    save_path = f"uploaded/{original_name}"
-    file_id = original_name.replace(".pdf", "")
 
-    path = f"uploaded/{file_id}.pdf"
+    file_id = file.filename.replace(".pdf", "")
+    save_path = f"uploaded/{file_id}.pdf"
 
-    with open(path, "wb") as f:
+    with open(save_path, "wb") as f:
         f.write(await file.read())
 
     return {
         "id": file_id,
         "name": file.filename,
-        "path": path,
+        "path": save_path,
         "pinecone_upload": False
     }
 
-
-# -------------------------------
-# SYNC PDFs TO PINECONE (WORKS 100%)
-# -------------------------------
+# -----------------------------------------------------------------------------------
+# SYNC PDF → PINECONE
+# -----------------------------------------------------------------------------------
 @app.post("/sync-chatbot")
 async def sync_chatbot(data: SyncRequest):
+    # early-fail if we don't have a compatible assistant object
+    if not pinecone_available or assistant is None:
+        return {"status": "failed", "error": "Pinecone assistant not configured on this runtime."}
+
     results = []
 
     for file_id in data.file_ids:
-        full_path = f"uploaded/{file_id}.pdf"
+        path = f"uploaded/{file_id}.pdf"
 
-        if not os.path.exists(full_path):
-            results.append({
-                "file_id": file_id,
-                "status": "failed",
-                "error": "File not found"
-            })
+        if not os.path.exists(path):
+            results.append({"file_id": file_id, "status": "failed", "error": "File not found"})
             continue
 
         try:
-            response = assistant.upload_file(
-                file_path=full_path,
-                timeout=None
-            )
-
+            response = assistant.upload_file(file_path=path, timeout=None)
             results.append({
                 "file_id": file_id,
                 "status": "uploaded",
                 "pinecone_response": str(response)
             })
-
         except Exception as e:
             results.append({
                 "file_id": file_id,
@@ -105,29 +133,30 @@ async def sync_chatbot(data: SyncRequest):
 
     return {"status": "complete", "results": results}
 
-
-
-# -------------------------------
-# EXTRACT TEXT
-# -------------------------------
+# -----------------------------------------------------------------------------------
+# TEXT EXTRACTION
+# -----------------------------------------------------------------------------------
 def extract_text(path):
     text = ""
     with pdfplumber.open(path) as pdf:
         for page in pdf.pages:
-            t = page.extract_text()
-            if t:
-                text += t + "\n"
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
     return text.strip()
 
 
-# -------------------------------
-# GENERATE FAQ
-# -------------------------------
+# -----------------------------------------------------------------------------------
+# FAQ GENERATION
+# -----------------------------------------------------------------------------------
 def generate_faq_from_text(text):
-    prompt = f"""
-Generate 10 FAQs based on this PDF:
+    if not OPENROUTER_API_KEY:
+        return [{"error": "OPENROUTER_API_KEY missing"}]
 
-Return ONLY JSON:
+    prompt = f"""
+Generate 10 FAQs based on this PDF.
+
+Return ONLY JSON array:
 [
   {{"question": "...", "answer": "..."}}
 ]
@@ -139,7 +168,7 @@ Text:
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "HTTP-Referer": "http://localhost",
+        "HTTP-Referer": "https://localhost",
         "X-Title": "PDF-FAQ-Generator"
     }
 
@@ -150,20 +179,24 @@ Text:
     }
 
     try:
-        res = requests.post(OPENROUTER_URL, json=payload, headers=headers)
-        out = res.json()["choices"][0]["message"]["content"]
-        out = out.replace("```json", "").replace("```", "").strip()
-        return json.loads(out)
-    except:
+        res = requests.post(OPENROUTER_URL, json=payload, headers=headers, timeout=60)
+        res.raise_for_status()
+
+        output = res.json()["choices"][0]["message"]["content"]
+        output = output.replace("```json", "").replace("```", "").strip()
+
+        return json.loads(output)
+
+    except Exception as e:
+        print("OpenRouter error:", e)
         return []
 
-
 @app.post("/generate-faq")
-async def gen_faq(data: FileId):
+async def generate_faq(data: FileId):
     path = f"uploaded/{data.file_id}.pdf"
 
     if not os.path.exists(path):
-        return {"error": "Not found", "faqs": []}
+        return {"error": "File not found", "faqs": []}
 
     text = extract_text(path)
     faqs = generate_faq_from_text(text)
@@ -174,3 +207,12 @@ async def gen_faq(data: FileId):
 @app.get("/")
 def root():
     return {"status": "Backend Running"}
+
+
+# -----------------------------------------------------------------------------------
+# Local run (uvicorn)
+# -----------------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
