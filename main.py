@@ -23,7 +23,7 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "*")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL] if FRONTEND_URL != "*" else ["*"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -209,7 +209,7 @@ def root():
     return {"status": "Backend Running"}
 
 
-#--------------------------------------------------------------------
+# -----------------------------------------------------------------------------------
 # Local run (uvicorn)
 # -----------------------------------------------------------------------------------
 if __name__ == "__main__":
