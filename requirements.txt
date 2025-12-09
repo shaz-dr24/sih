@@ -2,6 +2,7 @@ fastapi
 uvicorn
 python-dotenv
 pydantic
-pinecone-client
+pinecone
 pdfplumber
 requests
+
